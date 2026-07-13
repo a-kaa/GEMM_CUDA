@@ -100,7 +100,7 @@ sed -i "s/const uint K11_TN = .*/const uint K11_TN = $TN;/" $RUNNER
 # Rebuild the program
 make
 
-echo "($CONFIG_NUM/$TOTAL_CONFIGS): BK=$BK BM=$BM BN=$BN WM=$WM WN=$WN WN_ITER=$WN_ITER TM=$TM TN=$TN NUM_THREADS=$NUM_THREADS" |& tee -a $OUTPUT
+echo "($CONFIG_NUM/$TOTAL_CONFIGS): BK=$BK BM=$BM BN=$BN WM=$WM WN=$WN WN_ITER=$WN_ITER TM=$TM TN=$TN NUM_THREADS=$NUM_THREADS" 2>&1 | tee -a $OUTPUT
 # Run the benchmark and get the result
 # Kill the program after 8 seconds if it doesn't finish
 timeout -v 8 ./sgemm 11 | tee -a $OUTPUT

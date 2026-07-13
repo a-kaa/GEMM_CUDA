@@ -102,12 +102,15 @@ void print_matrix(const float *A, int M, int N, std::ofstream &fs) {
   fs << "]\n";
 }
 
-bool verify_matrix(float *matRef, float *matOut, int N) {
+bool verify_matrix(float *matRef, float *matOut, int N, float abs_tolerance,
+                   float relative_tolerance) {
   double diff = 0.0;
   int i;
   for (i = 0; i < N; i++) {
     diff = std::fabs(matRef[i] - matOut[i]);
-    if (isnan(diff) || diff > 0.01) {
+    const double tolerance =
+        abs_tolerance + relative_tolerance * std::fabs(matRef[i]);
+    if (isnan(diff) || diff > tolerance) {
       printf("Divergence! Should %5.2f, Is %5.2f (Diff %5.2f) at %d\n",
              matRef[i], matOut[i], diff, i);
       return false;
@@ -142,56 +145,58 @@ void runCublasBF16(cublasHandle_t handle, int M, int N, int K, float alpha,
 
 void runCublasTF32(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // This runs cuBLAS with mixed precision (performing the mul with operands
-  // downcast to bf16), which is ~4x faster
+  // TF32 保留 FP32 的指数范围，但乘法输入只有 10-bit mantissa。Hopper 的
+  // Tensor Core kernel 必须以同一计算契约作为参考，不能与严格 FP32 混比。
   cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
                N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
                CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-void run_sgemm_naive(int M, int N, int K, float alpha, float *A, float *B,
-                     float beta, float *C) {
+// 以下 1--12 号 host wrapper 属于 Ampere 系列。它们保留原内核实现，仅将
+// 调度名称显式标出架构归属，便于和 Hopper 路径并列维护。
+void runAmpereNaive(int M, int N, int K, float alpha, float *A, float *B,
+                    float beta, float *C) {
   dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
   dim3 blockDim(32, 32);
-  sgemm_naive<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+  ampereK01Naive<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-void run_sgemm_coalesce(int M, int N, int K, float alpha, float *A, float *B,
-                        float beta, float *C) {
+void runAmpereGlobalMemCoalesce(int M, int N, int K, float alpha, float *A,
+                                float *B, float beta, float *C) {
   dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
   dim3 blockDim(32 * 32);
-  sgemm_global_mem_coalesce<32>
+  ampereK02GlobalMemCoalesce<32>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-void run_sgemm_shared_mem_block(int M, int N, int K, float alpha, float *A,
+void runAmpereSharedMemBlocking(int M, int N, int K, float alpha, float *A,
                                 float *B, float beta, float *C) {
   dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
   dim3 blockDim(32 * 32);
   // L1 cache becomes useless, since we access GMEM only via SMEM, so we carve
   // out all of L1 to SMEM. This doesn't currently make a difference, since
   // occupancy is limited by reg and thread count, but it's good to do anyway.
-  cudaFuncSetAttribute(sgemm_shared_mem_block<32>,
+  cudaFuncSetAttribute(ampereK03SharedMemBlocking<32>,
                        cudaFuncAttributePreferredSharedMemoryCarveout,
                        cudaSharedmemCarveoutMaxShared);
-  sgemm_shared_mem_block<32>
+  ampereK03SharedMemBlocking<32>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-void runSgemm1DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
-                           float beta, float *C) {
+void runAmpere1DBlockTiling(int M, int N, int K, float alpha, float *A,
+                            float *B, float beta, float *C) {
   const uint BM = 64;
   const uint BN = 64;
   const uint BK = 8;
   const uint TM = 8;
   dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
   dim3 blockDim((BM * BN) / TM);
-  sgemm1DBlocktiling<BM, BN, BK, TM>
+  ampereK04BlockTiling1D<BM, BN, BK, TM>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-void runSgemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
-                           float beta, float *C) {
+void runAmpere2DBlockTiling(int M, int N, int K, float alpha, float *A,
+                            float *B, float beta, float *C) {
   const uint BK = 8;
   const uint TM = 8;
   const uint TN = 8;
@@ -200,7 +205,7 @@ void runSgemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
     const uint BN = 128;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemm2DBlocktiling<BM, BN, BK, TM, TN>
+    ampereK05BlockTiling2D<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
     // this is a hacky solution to the underlying problem
@@ -209,13 +214,13 @@ void runSgemm2DBlocktiling(int M, int N, int K, float alpha, float *A, float *B,
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemm2DBlocktiling<BM, BN, BK, TM, TN>
+    ampereK05BlockTiling2D<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   }
 }
 
-void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
-                       float beta, float *C) {
+void runAmpereVectorizedAccess(int M, int N, int K, float alpha, float *A,
+                               float *B, float beta, float *C) {
   const uint BK = 8;
   const uint TM = 8;
   const uint TN = 8;
@@ -224,7 +229,7 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     const uint BN = 128;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize<BM, BN, BK, TM, TN>
+    ampereK06VectorizedAccess<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
     // this is a hacky solution to the underlying problem
@@ -233,13 +238,14 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize<BM, BN, BK, TM, TN>
+    ampereK06VectorizedAccess<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   }
 }
 
-void runSgemmResolveBankConflicts(int M, int N, int K, float alpha, float *A,
-                                  float *B, float beta, float *C) {
+void runAmpereBankConflictLinearized(int M, int N, int K, float alpha,
+                                     float *A, float *B, float beta,
+                                     float *C) {
   const uint BK = 8;
   const uint TM = 8;
   const uint TN = 8;
@@ -248,7 +254,7 @@ void runSgemmResolveBankConflicts(int M, int N, int K, float alpha, float *A,
     const uint BN = 128;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankConflicts<BM, BN, BK, TM, TN>
+    ampereK07BankConflictLinearized<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
     // this is a hacky solution to the underlying problem
@@ -257,12 +263,12 @@ void runSgemmResolveBankConflicts(int M, int N, int K, float alpha, float *A,
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankConflicts<BM, BN, BK, TM, TN>
+    ampereK07BankConflictLinearized<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   }
 }
 
-void runSgemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
+void runAmpereBankConflictPadded(int M, int N, int K, float alpha, float *A,
                                  float *B, float beta, float *C) {
   const uint BK = 8;
   const uint TM = 8;
@@ -272,7 +278,7 @@ void runSgemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
     const uint BN = 128;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankExtraCol<BM, BN, BK, TM, TN>
+    ampereK08BankConflictPadded<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
     // this is a hacky solution to the underlying problem
@@ -281,13 +287,13 @@ void runSgemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
     const uint BN = 64;
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankExtraCol<BM, BN, BK, TM, TN>
+    ampereK08BankConflictPadded<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   }
 }
 
-void runSgemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
-                       float beta, float *C) {
+void runAmpereAutotuned(int M, int N, int K, float alpha, float *A, float *B,
+                         float beta, float *C) {
   // A100
   // const uint K9_BK = 16;
   // const uint K9_TM = 4;
@@ -324,12 +330,12 @@ void runSgemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
                 "K9_BN*K9_BK must be a multiple of 4*256 to vectorize loads");
 
   dim3 gridDim(CEIL_DIV(N, K9_BN), CEIL_DIV(M, K9_BM));
-  sgemmAutotuned<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
+  ampereK09Autotuned<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-void runSgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
-                        float beta, float *C) {
+void runAmpereWarpTiling(int M, int N, int K, float alpha, float *A, float *B,
+                          float beta, float *C) {
   // Settings for A100
   // const uint K10_NUM_THREADS = 128;
   // const uint K10_BN = 128;
@@ -384,13 +390,13 @@ void runSgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
                 "BN*BK must be a multiple of 4*256 to vectorize loads");
 
   dim3 gridDim(CEIL_DIV(N, K10_BN), CEIL_DIV(M, K10_BM));
-  sgemmWarptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
-                  K10_TN, K10_NUM_THREADS>
+  ampereK10WarpTiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER,
+                       K10_TM, K10_TN, K10_NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
-                             float *B, float beta, float *C) {
+void runAmpereSoftwareDoubleBuffer(int M, int N, int K, float alpha, float *A,
+                                   float *B, float beta, float *C) {
   // Settings for A100
   // const uint K11_NUM_THREADS = 256;
   // const uint K11_BN = 128;
@@ -445,13 +451,13 @@ void runSgemmDoubleBuffering(int M, int N, int K, float alpha, float *A,
                 "BN*BK must be a multiple of 4*256 to vectorize loads");
 
   dim3 gridDim(CEIL_DIV(N, K11_BN), CEIL_DIV(M, K11_BM));
-  sgemmDoubleBuffering<K11_BM, K11_BN, K11_BK, K11_WM, K11_WN, K11_WNITER,
-                       K11_TM, K11_TN, K11_NUM_THREADS>
+  ampereK11SoftwareDoubleBuffer<K11_BM, K11_BN, K11_BK, K11_WM, K11_WN,
+                                 K11_WNITER, K11_TM, K11_TN, K11_NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
-                              float *B, float beta, float *C) {
+void runAmpereCpAsyncDoubleBuffer(int M, int N, int K, float alpha, float *A,
+                                  float *B, float beta, float *C) {
   // Settings for A6000
   const uint K12_NUM_THREADS = 128;
   const uint K12_BN = 128;
@@ -496,8 +502,8 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
                 "BN*BK must be a multiple of 4*256 to vectorize loads");
 
   dim3 gridDim(CEIL_DIV(N, K12_BN), CEIL_DIV(M, K12_BM));
-  runSgemmDoubleBuffering2<K12_BM, K12_BN, K12_BK, K12_WM, K12_WN, K12_WNITER,
-                           K12_TM, K12_TN, K12_NUM_THREADS>
+  ampereK12CpAsyncDoubleBuffer<K12_BM, K12_BN, K12_BK, K12_WM, K12_WN,
+                                K12_WNITER, K12_TM, K12_TN, K12_NUM_THREADS>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
@@ -508,40 +514,52 @@ void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
     runCublasFP32(handle, M, N, K, alpha, A, B, beta, C);
     break;
   case 1:
-    run_sgemm_naive(M, N, K, alpha, A, B, beta, C);
+    runAmpereNaive(M, N, K, alpha, A, B, beta, C);
     break;
   case 2:
-    run_sgemm_coalesce(M, N, K, alpha, A, B, beta, C);
+    runAmpereGlobalMemCoalesce(M, N, K, alpha, A, B, beta, C);
     break;
   case 3:
-    run_sgemm_shared_mem_block(M, N, K, alpha, A, B, beta, C);
+    runAmpereSharedMemBlocking(M, N, K, alpha, A, B, beta, C);
     break;
   case 4:
-    runSgemm1DBlocktiling(M, N, K, alpha, A, B, beta, C);
+    runAmpere1DBlockTiling(M, N, K, alpha, A, B, beta, C);
     break;
   case 5:
-    runSgemm2DBlocktiling(M, N, K, alpha, A, B, beta, C);
+    runAmpere2DBlockTiling(M, N, K, alpha, A, B, beta, C);
     break;
   case 6:
-    runSgemmVectorize(M, N, K, alpha, A, B, beta, C);
+    runAmpereVectorizedAccess(M, N, K, alpha, A, B, beta, C);
     break;
   case 7:
-    runSgemmResolveBankConflicts(M, N, K, alpha, A, B, beta, C);
+    runAmpereBankConflictLinearized(M, N, K, alpha, A, B, beta, C);
     break;
   case 8:
-    runSgemmResolveBankExtraCol(M, N, K, alpha, A, B, beta, C);
+    runAmpereBankConflictPadded(M, N, K, alpha, A, B, beta, C);
     break;
   case 9:
-    runSgemmAutotuned(M, N, K, alpha, A, B, beta, C);
+    runAmpereAutotuned(M, N, K, alpha, A, B, beta, C);
     break;
   case 10:
-    runSgemmWarptiling(M, N, K, alpha, A, B, beta, C);
+    runAmpereWarpTiling(M, N, K, alpha, A, B, beta, C);
     break;
   case 11:
-    runSgemmDoubleBuffering(M, N, K, alpha, A, B, beta, C);
+    runAmpereSoftwareDoubleBuffer(M, N, K, alpha, A, B, beta, C);
     break;
   case 12:
-    runSgemmDoubleBuffering2(M, N, K, alpha, A, B, beta, C);
+    runAmpereCpAsyncDoubleBuffer(M, N, K, alpha, A, B, beta, C);
+    break;
+  case 13:
+    hopper::launchHopperTmaFp32(M, N, K, alpha, A, B, beta, C);
+    break;
+  case 14:
+    hopper::launchHopperTmaDoubleBufferedFp32(M, N, K, alpha, A, B, beta, C);
+    break;
+  case 15:
+    hopper::launchHopperTensorCoreTf32(M, N, K, alpha, A, B, beta, C);
+    break;
+  case 16:
+    hopper::launchHopperTmaTensorCoreTf32(M, N, K, alpha, A, B, beta, C);
     break;
   default:
     throw std::invalid_argument("Unknown kernel number");

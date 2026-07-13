@@ -12,15 +12,15 @@ const std::string errLogFile = "matrixValidationFailure.txt";
 
 int main(int argc, char **argv) {
   if (argc != 2) {
-    std::cerr << "Please select a kernel (range 0 - 12, 0 for NVIDIA cuBLAS)"
+    std::cerr << "Please select a kernel (range 0 - 16, 0 for NVIDIA cuBLAS)"
               << std::endl;
     exit(EXIT_FAILURE);
   }
 
   // get kernel number
   int kernel_num = std::stoi(argv[1]);
-  if (kernel_num < 0 || kernel_num > 12) {
-    std::cerr << "Please enter a valid kernel number (0-12)" << std::endl;
+  if (kernel_num < 0 || kernel_num > 16) {
+    std::cerr << "Please enter a valid kernel number (0-16)" << std::endl;
     exit(EXIT_FAILURE);
   }
 
@@ -98,8 +98,14 @@ int main(int argc, char **argv) {
     // Verify the correctness of the calculation, and execute it once before the
     // kernel function timing to avoid cold start errors
     if (kernel_num != 0) {
-      run_kernel(0, m, n, k, alpha, dA, dB, beta, dC_ref,
-                 handle); // cuBLAS
+      if (kernel_num == 15 || kernel_num == 16) {
+        // Tensor Core TF32 kernel 使用 TF32：参考值也必须使用 TF32，而非严格
+        // FP32，否则舍入差异会被错误地判定为实现错误。
+        runCublasTF32(handle, m, n, k, alpha, dA, dB, beta, dC_ref);
+      } else {
+        run_kernel(0, m, n, k, alpha, dA, dB, beta, dC_ref,
+                   handle); // Strict FP32 cuBLAS reference.
+      }
       run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC,
                  handle); // Executes the kernel, modifies the result matrix
       cudaCheck(cudaDeviceSynchronize());
@@ -107,7 +113,10 @@ int main(int argc, char **argv) {
       cudaMemcpy(C, dC, sizeof(float) * m * n, cudaMemcpyDeviceToHost);
       cudaMemcpy(C_ref, dC_ref, sizeof(float) * m * n, cudaMemcpyDeviceToHost);
 
-      if (!verify_matrix(C_ref, C, m * n)) {
+      const bool is_tf32_kernel = kernel_num == 15 || kernel_num == 16;
+      const float abs_tolerance = is_tf32_kernel ? 0.25f : 0.01f;
+      const float relative_tolerance = is_tf32_kernel ? 2.0e-3f : 0.0f;
+      if (!verify_matrix(C_ref, C, m * n, abs_tolerance, relative_tolerance)) {
         std::cout
             << "Failed to pass the correctness verification against NVIDIA "
                "cuBLAS."

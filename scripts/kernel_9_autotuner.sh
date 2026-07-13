@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 cd "../build"
 
 RUNNER="../src/runner.cu"
-KERNEL="../src/kernels/9_kernel_autotuned.cuh"
+KERNEL="../src/kernels/ampere/ampere_k09_autotuned.cuh"
 OUTPUT="../benchmark_results/kernel_9_autotune_results.txt"
 
 # Clear the output file
@@ -74,7 +74,7 @@ for bk in ${BK_VALUES[@]}; do
             # Rebuild the program
             make 
 
-            echo "($CONFIG_NUM/$TOTAL_CONFIGS): BK=$bk TM=$tm TN=$tn BM=$bm BN=$bn NUM_THREADS=$nt" |& tee -a $OUTPUT
+            echo "($CONFIG_NUM/$TOTAL_CONFIGS): BK=$bk TM=$tm TN=$tn BM=$bm BN=$bn NUM_THREADS=$nt" 2>&1 | tee -a $OUTPUT
             # Run the benchmark and get the result
             # Kill the program after 4 seconds if it doesn't finish
             timeout -v 4 ./sgemm 9 | tee -a $OUTPUT

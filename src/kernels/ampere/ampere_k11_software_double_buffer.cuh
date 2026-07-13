@@ -8,21 +8,19 @@
 #include <cuda_runtime.h>
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-const int WARPSIZE = 32; // warpSize is not constexpr
 
-namespace wt {
+namespace db {
+
 template <const int BM, const int BN, const int BK, const int rowStrideA,
           const int rowStrideB>
-__device__ void loadFromGmem(int N, int K, const float *A, const float *B,
-                             float *As, float *Bs, int innerRowA, int innerColA,
-                             int innerRowB, int innerColB) {
+__device__ void loadFromGmem(const int N, const int K, float *A, float *B,
+                             float *As, float *Bs, const int innerRowA,
+                             const int innerColA, const int innerRowB,
+                             const int innerColB) {
   for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
-    const float4 tmp = reinterpret_cast<const float4 *>(
+    float4 tmp = reinterpret_cast<float4 *>(
         &A[(innerRowA + offset) * K + innerColA * 4])[0];
-    // float4 tmp;
-    // asm("ld.global.nc.v4.f32 {%0, %1, %2, %3}, [%4];"
-    //     : "=f"(tmp.x), "=f"(tmp.y), "=f"(tmp.z), "=f"(tmp.w)
-    //     : "l"(&A[(innerRowA + offset) * K + innerColA * 4]));
+    // transpose A while storing it
     As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
     As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
     As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
@@ -32,14 +30,8 @@ __device__ void loadFromGmem(int N, int K, const float *A, const float *B,
   for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
     reinterpret_cast<float4 *>(
         &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
-        reinterpret_cast<const float4 *>(
+        reinterpret_cast<float4 *>(
             &B[(innerRowB + offset) * N + innerColB * 4])[0];
-    // asm("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
-    //     : "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 0]),
-    //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 1]),
-    //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 2]),
-    //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 3])
-    //     : "l"(&B[(innerRowB + offset) * N + innerColB * 4]));
   }
 }
 
@@ -84,24 +76,14 @@ processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
   }
 }
 
-} // namespace wt
+} // namespace db
 
-/*
- * @tparam BM The threadblock size for M dimension SMEM caching.
- * @tparam BN The threadblock size for N dimension SMEM caching.
- * @tparam BK The threadblock size for K dimension SMEM caching.
- * @tparam WM M dim of continuous tile computed by each warp
- * @tparam WN N dim of continuous tile computed by each warp
- * @tparam WMITER The number of subwarp tiling steps in M dimension.
- * @tparam WNITER The number of subwarp tiling steps in N dimension.
- * @tparam TM The per-thread tile size for M dimension.
- * @tparam TN The per-thread tile size for N dimension.
- */
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WNITER, const int TM, const int TN, const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
-    sgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
-                    float beta, float *C) {
+    ampereK11SoftwareDoubleBuffer(const int M, const int N, const int K,
+                                  const float alpha, float *A, float *B,
+                                  float beta, float *C) {
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
@@ -121,8 +103,11 @@ __global__ void __launch_bounds__(NUM_THREADS)
   const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN); // i/4
 
   // allocate space for the current blocktile in SMEM
-  __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+  __shared__ float As[2 * BM * BK];
+  __shared__ float Bs[2 * BK * BN];
+
+  // setup double buffering split
+  bool doubleBufferIdx = threadIdx.x >= (NUM_THREADS / 2);
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;
@@ -131,13 +116,14 @@ __global__ void __launch_bounds__(NUM_THREADS)
   C += (cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN;
 
   // calculating the indices that this thread will load into SMEM
-  // we'll load 128bit / 32bit = 4 elements per thread at each step
-  const uint innerRowA = threadIdx.x / (BK / 4);
-  const uint innerColA = threadIdx.x % (BK / 4);
-  constexpr uint rowStrideA = (NUM_THREADS * 4) / BK;
-  const uint innerRowB = threadIdx.x / (BN / 4);
-  const uint innerColB = threadIdx.x % (BN / 4);
-  constexpr uint rowStrideB = NUM_THREADS / (BN / 4);
+  // for the loading, we're pretending like there's half as many threads
+  // as there actually are
+  const uint innerRowA = (threadIdx.x % (NUM_THREADS / 2)) / (BK / 4);
+  const uint innerColA = (threadIdx.x % (NUM_THREADS / 2)) % (BK / 4);
+  constexpr uint rowStrideA = ((NUM_THREADS / 2) * 4) / BK;
+  const uint innerRowB = (threadIdx.x % (NUM_THREADS / 2)) / (BN / 4);
+  const uint innerColB = (threadIdx.x % (NUM_THREADS / 2)) % (BN / 4);
+  constexpr uint rowStrideB = (NUM_THREADS / 2) / (BN / 4);
 
   // allocate thread-local cache for results in registerfile
   float threadResults[WMITER * TM * WNITER * TN] = {0.0};
@@ -145,16 +131,63 @@ __global__ void __launch_bounds__(NUM_THREADS)
   float regM[WMITER * TM] = {0.0};
   float regN[WNITER * TN] = {0.0};
 
-  // outer-most loop over block tiles
-  for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    wt::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
+  if (doubleBufferIdx == 0) {
+    // load first (B0)
+    db::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
         N, K, A, B, As, Bs, innerRowA, innerColA, innerRowB, innerColB);
-    __syncthreads();
-    wt::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM,
-                        TN>(regM, regN, threadResults, As, Bs, warpRow, warpCol,
-                            threadRowInWarp, threadColInWarp);
-    A += BK;     // move BK columns to right
-    B += BK * N; // move BK rows down
+  }
+  __syncthreads();
+
+  // outer-most loop over block tiles
+  for (uint bkIdx = 0; bkIdx < K; bkIdx += 2 * BK) {
+    if (doubleBufferIdx == 0) {
+      // process current (B0)
+      db::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM,
+                          TN>(regM, regN, threadResults, As, Bs, warpRow,
+                              warpCol, threadRowInWarp, threadColInWarp);
+      __syncthreads();
+
+      // process current+1 (B1)
+      if (bkIdx + BK < K) {
+        db::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN,
+                            TM, TN>(regM, regN, threadResults, As + (BM * BK),
+                                    Bs + (BK * BN), warpRow, warpCol,
+                                    threadRowInWarp, threadColInWarp);
+      }
+      __syncthreads();
+
+      // load current + 2 (B0)
+      if (bkIdx + 2 * BK < K) {
+        db::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
+            N, K, A + 2 * BK, B + 2 * BK * N, As, Bs, innerRowA, innerColA,
+            innerRowB, innerColB);
+      }
+    } else {
+      // load current + 1 (B1)
+      if (bkIdx + BK < K) {
+        db::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
+            N, K, A + BK, B + BK * N, As + (BM * BK), Bs + (BK * BN), innerRowA,
+            innerColA, innerRowB, innerColB);
+      }
+      __syncthreads();
+
+      // process current (B0)
+      db::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM,
+                          TN>(regM, regN, threadResults, As, Bs, warpRow,
+                              warpCol, threadRowInWarp, threadColInWarp);
+      __syncthreads();
+
+      // process current+1 (B1)
+      if (bkIdx + BK < K) {
+        db::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN,
+                            TM, TN>(regM, regN, threadResults, As + (BM * BK),
+                                    Bs + (BK * BN), warpRow, warpCol,
+                                    threadRowInWarp, threadColInWarp);
+      }
+    }
+
+    A += 2 * BK;     // move BK columns to right
+    B += 2 * BK * N; // move BK rows down
     __syncthreads();
   }
 

@@ -10,8 +10,9 @@
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
-                               float *B, float beta, float *C) {
+__global__ void ampereK08BankConflictPadded(int M, int N, int K, float alpha,
+                                             float *A, float *B, float beta,
+                                             float *C) {
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
@@ -21,7 +22,8 @@ __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
 
   // allocate space for the current blocktile in smem
   __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+  const int extraCols = 5;
+  __shared__ float Bs[BK * (BN + extraCols)];
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;
@@ -51,8 +53,11 @@ __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
     As[(innerColA * 4 + 2) * BM + innerRowA] = tmp.z;
     As[(innerColA * 4 + 3) * BM + innerRowA] = tmp.w;
 
-    reinterpret_cast<float4 *>(&Bs[innerRowB * BN + innerColB * 4])[0] =
-        reinterpret_cast<float4 *>(&B[innerRowB * N + innerColB * 4])[0];
+    tmp = reinterpret_cast<float4 *>(&B[innerRowB * N + innerColB * 4])[0];
+    Bs[innerRowB * (BN + extraCols) + innerColB * 4 + 0] = tmp.x;
+    Bs[innerRowB * (BN + extraCols) + innerColB * 4 + 1] = tmp.y;
+    Bs[innerRowB * (BN + extraCols) + innerColB * 4 + 2] = tmp.z;
+    Bs[innerRowB * (BN + extraCols) + innerColB * 4 + 3] = tmp.w;
     __syncthreads();
 
     // advance blocktile
@@ -66,7 +71,7 @@ __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
         regM[i] = As[dotIdx * BM + threadRow * TM + i];
       }
       for (uint i = 0; i < TN; ++i) {
-        regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+        regN[i] = Bs[dotIdx * (BN + extraCols) + threadCol * TN + i];
       }
       for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
         for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {

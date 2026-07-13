@@ -31,7 +31,12 @@ KERNEL_NAMES = {
     8: "Avoid Bank Conflicts (Offset)",
     9: "Autotuning",
     10: "Warptiling",
-    11: "Double Buffering",
+    11: "Ampere Software Double Buffering",
+    12: "Ampere cp.async Double Buffering",
+    13: "Hopper TMA FP32",
+    14: "Hopper TMA Double Buffered FP32",
+    15: "Hopper Tensor Core TF32",
+    16: "Hopper TMA + Tensor Core TF32",
 }
 
 
@@ -74,13 +79,14 @@ def plot(df: pd.DataFrame):
     # add small lines at the xticks
 
     # display the kernel names right next to the corresponding line
-    for i, kernel in enumerate(df["kernel"].unique()):
+    for kernel in df["kernel"].unique():
+        kernel_data = df[df["kernel"] == kernel]
         # right align the text
         plt.text(
-            df[df["kernel"] == i]["size"].iloc[-1],
-            df[df["kernel"] == i]["gflops"].iloc[-1] + 300,
-            f"{i}:{KERNEL_NAMES[i]}",
-            color=colors[i],
+            kernel_data["size"].iloc[-1],
+            kernel_data["gflops"].iloc[-1] + 300,
+            f"{kernel}:{KERNEL_NAMES[kernel]}",
+            color=colors[list(df["kernel"].unique()).index(kernel)],
             horizontalalignment="left",
             weight="medium",
         )
@@ -115,8 +121,14 @@ if __name__ == "__main__":
 
     df = df[df["size"] == 4096].sort_values(by="gflops", ascending=True)[["kernel", "gflops"]]
     df["kernel"] = df["kernel"].map({k: f"{k}: {v}" for k, v in KERNEL_NAMES.items()})
-    df["relperf"] = df["gflops"] / df[df["kernel"] == "0: cuBLAS"]["gflops"].iloc[0]
-    df["relperf"] = df["relperf"].apply(lambda x: f"{x*100:.1f}%")
+    baseline = df.loc[df["kernel"] == "0: cuBLAS", "gflops"]
+    # 单独画 Hopper kernel 时可能没有 0 号结果；此时仍生成绝对性能表，
+    # 而不是因为缺少相对性能基线中断整个 benchmark 流程。
+    if baseline.empty:
+        df["relperf"] = "N/A (no cuBLAS baseline)"
+    else:
+        df["relperf"] = df["gflops"] / baseline.iloc[0]
+        df["relperf"] = df["relperf"].apply(lambda x: f"{x*100:.1f}%")
     df.columns = ["Kernel", "GFLOPs/s", "Performance relative to cuBLAS"]
 
     # update the README.md with the new results

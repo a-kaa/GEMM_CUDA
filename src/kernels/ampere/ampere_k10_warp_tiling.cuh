@@ -2,46 +2,44 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cooperative_groups.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cublas_v2.h>
-#include <cuda/barrier>
 #include <cuda_runtime.h>
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+const int WARPSIZE = 32; // warpSize is not constexpr
 
-namespace {
+namespace wt {
 template <const int BM, const int BN, const int BK, const int rowStrideA,
-          const int rowStrideB, typename T>
-__device__ void loadFromGmem(int N, int K, float *A, float *B, float *As,
-                             float *Bs, int innerRowA, int innerColA,
-                             int innerRowB, int innerColB, T &barrier) {
-
+          const int rowStrideB>
+__device__ void loadFromGmem(int N, int K, const float *A, const float *B,
+                             float *As, float *Bs, int innerRowA, int innerColA,
+                             int innerRowB, int innerColB) {
   for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
-    cuda::memcpy_async(&As[(innerColA * 4 + 0) * BM + innerRowA + offset],
-                       &A[(innerRowA + offset) * K + innerColA * 4],
-                       cuda::aligned_size_t<sizeof(float)>(sizeof(float)),
-                       barrier);
-    cuda::memcpy_async(&As[(innerColA * 4 + 1) * BM + innerRowA + offset],
-                       &A[(innerRowA + offset) * K + innerColA * 4 + 1],
-                       cuda::aligned_size_t<sizeof(float)>(sizeof(float)),
-                       barrier);
-    cuda::memcpy_async(&As[(innerColA * 4 + 2) * BM + innerRowA + offset],
-                       &A[(innerRowA + offset) * K + innerColA * 4 + 2],
-                       cuda::aligned_size_t<sizeof(float)>(sizeof(float)),
-                       barrier);
-    cuda::memcpy_async(&As[(innerColA * 4 + 3) * BM + innerRowA + offset],
-                       &A[(innerRowA + offset) * K + innerColA * 4 + 3],
-                       cuda::aligned_size_t<sizeof(float)>(sizeof(float)),
-                       barrier);
+    const float4 tmp = reinterpret_cast<const float4 *>(
+        &A[(innerRowA + offset) * K + innerColA * 4])[0];
+    // float4 tmp;
+    // asm("ld.global.nc.v4.f32 {%0, %1, %2, %3}, [%4];"
+    //     : "=f"(tmp.x), "=f"(tmp.y), "=f"(tmp.z), "=f"(tmp.w)
+    //     : "l"(&A[(innerRowA + offset) * K + innerColA * 4]));
+    As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
+    As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
+    As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
+    As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
   }
 
   for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
-    cuda::memcpy_async(&Bs[(innerRowB + offset) * BN + innerColB * 4],
-                       &B[(innerRowB + offset) * N + innerColB * 4],
-                       cuda::aligned_size_t<sizeof(float4)>(sizeof(float4)),
-                       barrier);
+    reinterpret_cast<float4 *>(
+        &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
+        reinterpret_cast<const float4 *>(
+            &B[(innerRowB + offset) * N + innerColB * 4])[0];
+    // asm("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+    //     : "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 0]),
+    //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 1]),
+    //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 2]),
+    //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 3])
+    //     : "l"(&B[(innerRowB + offset) * N + innerColB * 4]));
   }
 }
 
@@ -86,7 +84,7 @@ processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
   }
 }
 
-} // namespace
+} // namespace wt
 
 /*
  * @tparam BM The threadblock size for M dimension SMEM caching.
@@ -102,19 +100,8 @@ processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WNITER, const int TM, const int TN, const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
-    runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
-                             float *B, float beta, float *C) {
-  auto block = cooperative_groups::this_thread_block();
-  __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> frontBarrier;
-  __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> backBarrier;
-  auto frontBarrierPtr = &frontBarrier;
-  auto backBarrierPtr = &backBarrier;
-  if (block.thread_rank() == 0) {
-    init(&frontBarrier, block.size());
-    init(&backBarrier, block.size());
-  }
-  __syncthreads();
-
+    ampereK10WarpTiling(int M, int N, int K, float alpha, float *A, float *B,
+                        float beta, float *C) {
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
@@ -134,8 +121,8 @@ __global__ void __launch_bounds__(NUM_THREADS)
   const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN); // i/4
 
   // allocate space for the current blocktile in SMEM
-  __shared__ float As[2 * BM * BK];
-  __shared__ float Bs[2 * BK * BN];
+  __shared__ float As[BM * BK];
+  __shared__ float Bs[BK * BN];
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;
@@ -158,47 +145,18 @@ __global__ void __launch_bounds__(NUM_THREADS)
   float regM[WMITER * TM] = {0.0};
   float regN[WNITER * TN] = {0.0};
 
-  int As_offset = 0;
-  int Bs_offset = 0;
-
-  // double-buffering: load first blocktile into SMEM
-  loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
-      N, K, A, B, As + As_offset * BM * BK, Bs + Bs_offset * BK * BN, innerRowA,
-      innerColA, innerRowB, innerColB, (*frontBarrierPtr));
-
   // outer-most loop over block tiles
-  for (uint bkIdx = 0; bkIdx < K - BK; bkIdx += BK) {
-    // double-buffering: load next blocktile into SMEM
-    loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
-        N, K, A + BK, B + BK * N, As + (1 - As_offset) * BM * BK,
-        Bs + (1 - Bs_offset) * BK * BN, innerRowA, innerColA, innerRowB,
-        innerColB, (*backBarrierPtr));
-
-    // compute the current blocktile
-    (*frontBarrierPtr).arrive_and_wait();
-    processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM, TN>(
-        regM, regN, threadResults, As + As_offset * BM * BK,
-        Bs + Bs_offset * BK * BN, warpRow, warpCol, threadRowInWarp,
-        threadColInWarp);
+  for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
+    wt::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
+        N, K, A, B, As, Bs, innerRowA, innerColA, innerRowB, innerColB);
+    __syncthreads();
+    wt::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM,
+                        TN>(regM, regN, threadResults, As, Bs, warpRow, warpCol,
+                            threadRowInWarp, threadColInWarp);
     A += BK;     // move BK columns to right
     B += BK * N; // move BK rows down
-
-    As_offset = 1 - As_offset;
-    Bs_offset = 1 - Bs_offset;
-    // swap the front and back barriers
-    auto tmp = frontBarrierPtr;
-    frontBarrierPtr = backBarrierPtr;
-    backBarrierPtr = tmp;
-
     __syncthreads();
   }
-
-  // compute the last blocktile
-  (*frontBarrierPtr).arrive_and_wait();
-  processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM, TN>(
-      regM, regN, threadResults, As + As_offset * BM * BK,
-      Bs + Bs_offset * BK * BN, warpRow, warpCol, threadRowInWarp,
-      threadColInWarp);
 
   // write out the results
   for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {

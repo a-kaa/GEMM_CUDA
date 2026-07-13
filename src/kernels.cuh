@@ -1,14 +1,6 @@
 #pragma once
 
-#include "kernels/10_kernel_warptiling.cuh"
-#include "kernels/11_kernel_double_buffering.cuh"
-#include "kernels/12_kernel_double_buffering.cuh"
-#include "kernels/1_naive.cuh"
-#include "kernels/2_kernel_global_mem_coalesce.cuh"
-#include "kernels/3_kernel_shared_mem_blocking.cuh"
-#include "kernels/4_kernel_1D_blocktiling.cuh"
-#include "kernels/5_kernel_2D_blocktiling.cuh"
-#include "kernels/6_kernel_vectorize.cuh"
-#include "kernels/7_kernel_resolve_bank_conflicts.cuh"
-#include "kernels/8_kernel_bank_extra_col.cuh"
-#include "kernels/9_kernel_autotuned.cuh"
+// 统一入口按架构拆分。Ampere 保持原有学习路径；Hopper 使用独立的 TMA/
+// Tensor Core 实现，避免不同 ISA 的同步原语与参数相互污染。
+#include "kernels/ampere/ampere_kernels.cuh"
+#include "kernels/hopper/hopper_kernels.cuh"
