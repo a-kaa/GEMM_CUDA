@@ -2,6 +2,7 @@
 
 Step-by-step optimization of matrix multiplication, implemented in CUDA.
 For an explanation of each kernel, see [siboehm.com/CUDA-MMM](https://siboehm.com/articles/22/CUDA-MMM).
+中文学习资料见 [docs/gemm_cuda_guide_zh.md](docs/gemm_cuda_guide_zh.md)。
 
 ## Architecture Layout
 
